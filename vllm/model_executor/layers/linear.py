@@ -180,17 +180,15 @@ class LinearBase(torch.nn.Module):
                                                               prefix=prefix)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        # If it's a quantized weight
-        # Unpack quantized weight
+       
         if isinstance(param, PackedvLLMParameter):
-            # 解包量化权重
+           
             unpacked_weight = self.quant_method.cb.unpack_trellis(
                 loaded_weight, self.quant_method.quant_config.td_x *
                 self.quant_method.quant_config.td_y)
             param.data.copy_(unpacked_weight)
         else:
-            # Regular weight loading
-            # 普通权重加载
+            
             if len(loaded_weight.shape) == 0:
                 loaded_weight = loaded_weight.reshape(1)
             assert param.size() == loaded_weight.size()

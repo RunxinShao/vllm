@@ -231,84 +231,180 @@ def awq_gemm(input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor,
         return awq_gemm_triton(input, qweight, qzeros, scales, split_k_iters)
     return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
 
-
 # qtip
-def bitshift_codebook(L: int, K: int, V: int, tlut_bits: int,
-                      decode_mode: str) -> torch.Tensor:
+
+def decode_1mad(x: torch.Tensor) -> torch.Tensor:
+    x = x.to(torch.int64) & ((1 << 32) - 1)
+    x = x * 34038481 + 76625530
+    x = x & ((1 << 32) - 1)
+    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)
+    y = y - 510
+    return (y.to(torch.float32) / 147.800537109375)
+
+def decode_2mad(x: torch.Tensor) -> torch.Tensor:
+    x = x.to(torch.int64) & ((1 << 32) - 1)
+    x = x * 264435761 + 1013904223
+    x = x & ((1 << 32) - 1)
+    x = ((x * 1664525) >> 32) + x
+    x = x & ((1 << 32) - 1)
+    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)
+    y = y - 510
+    return (y.to(torch.float32) / 147.800537109375)
+
+def decode_3inst(x: torch.Tensor) -> torch.Tensor:
+    def bfe16_to_fp16(z: torch.Tensor) -> torch.Tensor:
+        arr = z.to(torch.int32)
+        mask = arr >= (1 << 15)
+        arr[mask] -= (1 << 16)
+        # 先在 CPU 上将 int16 reinterpret 为 float16，再搬回 GPU
+        tmp = arr.to(torch.int16).cpu().numpy().view(np.float16)
+        return torch.from_numpy(tmp).to(z.device)
+
+    a, b = 89226354, 64248484
+    fpmask = 996162400
+    z = x.to(torch.int64) & ((1 << 32) - 1)
+    z = z * a + b
+    mask = ((1 << 15) | ((1 << 12) - 1)) << 16
+    res = (mask & z) ^ fpmask
+    top = bfe16_to_fp16(res >> 16)
+    bot = bfe16_to_fp16(res & 0xFFFF)
+    return (top + bot).float()
+
+def quantlut(tlut: torch.Tensor, L: int, nbits: int) -> torch.Tensor:
+    # 非对称 quantlut
+    lut = torch.arange(1 << L, device=tlut.device)
+    lut = (lut + 1) * lut
+    lut = (lut >> (16 - nbits)) & ((1 << nbits) - 1)
+    return tlut[lut].T.contiguous()
+
+def quantlut_sym(tlut: torch.Tensor, L: int, nbits: int) -> torch.Tensor:
+    # 对称 quantlut
+    lut = torch.arange(1 << L, device=tlut.device)
+    lut = (lut + 1) * lut
+    sign = 1 - ((lut >> 15) & 1) * 2
+    lut = (lut >> (16 - nbits - 1)) & ((1 << nbits) - 1)
+    out = tlut[lut]
+    out[:, 0] = out[:, 0] * sign
+    return out.T.contiguous()
+
+# --- bitshift_codebook definition ---
+
+class bitshift_codebook(nn.Module):
+    def __init__(self,
+                 L: int,
+                 K: int,
+                 V: int,
+                 tlut_bits: int,
+                 decode_mode: str,
+                 tlut: torch.Tensor = None):
+        super().__init__()
+        self.L = L
+        self.K = K
+        self.V = V
+        self.tlut_bits = tlut_bits
+        self.decode_mode = decode_mode
+
+        levels = 1 << L
+
+        if decode_mode == 'lut':
+            # Use externally provided tlut or random initialization
+            if tlut is None:
+                assert tlut_bits == L
+                tbl = torch.randn(levels, V, dtype=torch.float16)
+            else:
+                tbl = tlut
+            # Store as [V, levels]
+            self.register_buffer('lut', tbl.T.contiguous())
+
+        elif decode_mode == '1mad':
+            assert V == 1
+            vals = decode_1mad(torch.arange(levels, device='cpu'))
+            self.register_buffer('lut', vals.unsqueeze(0).to(torch.float16))
+
+        elif decode_mode == '2mad':
+            assert V == 1
+            vals = decode_2mad(torch.arange(levels, device='cpu'))
+            self.register_buffer('lut', vals.unsqueeze(0).to(torch.float16))
+
+        elif decode_mode == '3inst':
+            assert V == 1
+            vals = decode_3inst(torch.arange(levels, device='cpu'))
+            self.register_buffer('lut', vals.unsqueeze(0).to(torch.float16))
+
+        elif decode_mode == 'quantlut':
+            assert tlut is not None
+            tbl = quantlut(tlut, L, tlut_bits)
+            self.register_buffer('lut', tbl)
+
+        elif decode_mode == 'quantlut_sym':
+            assert tlut is not None
+            tbl = quantlut_sym(tlut, L, tlut_bits)
+            self.register_buffer('lut', tbl)
+
+        else:
+            raise ValueError(f"Unsupported decode_mode: {decode_mode!r}")
+
+    def recons(self, encoded: torch.Tensor) -> torch.Tensor:
+        """
+        encoded: LongTensor([num_blocks, td_x*td_y])
+        returns: FloatTensor([V, num_blocks, td_x*td_y])
+        """
+        # encoded.long() ensures proper dtype, then gather from lut
+        # self.lut shape = [V, levels]
+        return self.lut[:, encoded.long()]
+def bitshift_gemm(
+    input: torch.Tensor,
+    trellis: torch.Tensor,
+    codebook: bitshift_codebook,
+    td_x: int,
+    td_y: int,
+    scale: float,
+    SU: torch.Tensor,
+    SV: torch.Tensor
+) -> torch.Tensor:
     """
-    创建QTIP的codebook
-    
+    Python fallback for QTIP Bitshift GEMM.
+
+    Steps:
+      1. Decode each block via codebook.recons → [V, num_blocks, block_size]
+      2. (V must be 1 in fallback) take recons[0] → [num_blocks, block_size]
+      3. Reshape & transpose to reconstruct full weight matrix hatW [m, n]
+      4. Compute input @ hatW^T and divide by scale → output [B, n]
+
     Args:
-        L: 每个权重的比特数
-        K: 每个codebook的条目数
-        V: codebook的数量
-        tlut_bits: 查表比特数
-        decode_mode: 解码模式
-        
-    Returns:
-        codebook: [V, 2^L] 形状的codebook张量
-    """
-    # 创建基础codebook
-    codebook = torch.zeros((V, 2**L), dtype=torch.float16)
-
-    # 根据decode_mode初始化codebook
-    if decode_mode == "uniform":
-        # 均匀分布
-        for v in range(V):
-            for i in range(2**L):
-                codebook[v, i] = (i - 2**(L - 1)) / (2**(L - 1))
-    elif decode_mode == "gaussian":
-        # 高斯分布
-        for v in range(V):
-            for i in range(2**L):
-                codebook[v, i] = torch.randn(1).item()
-    else:
-        raise ValueError(f"不支持的decode_mode: {decode_mode}")
-
-    return codebook
-
-
-def bitshift_gemm(input: torch.Tensor,
-                  trellis: torch.Tensor,
-                  codebook: torch.Tensor,
-                  td_x: int,
-                  td_y: int,
-                  scale: float = 32.0) -> torch.Tensor:
-    """
-    QTIP Bitshift GEMM (Pure Python fallback).
-    
-    Args:
-        input: [B, K] 输入激活
-        trellis: [num_blocks, T] trellis 编码索引
-        codebook: [V, 2^L] 查表（浮点重建）
-        td_x, td_y: tile 大小，用于还原矩阵形状
-        scale: 最终缩放因子（默认 QTIP 使用 32）
+        input:    [B, m]  activation tensor
+        trellis:  [num_blocks, td_x*td_y]  block-wise index matrix
+        codebook: bitshift_codebook instance (with .recons method)
+        td_x:     block row size
+        td_y:     block col size
+        scale:    dequantization scale factor
+        SU:       scale factor for input
+        SV:       scale factor for output
 
     Returns:
-        output: [B, N] 推理乘法结果
+        output: [B, n]  result of dequantized GEMM
     """
-    B, K = input.shape
-    m = K
-    n = trellis.shape[0]
-    T = td_x * td_y
+    B, m = input.shape
+    input = input.to(torch.float32) * SU  # ← SU corrects input
 
-    # 重建量化权重矩阵
-    recons = codebook[:, trellis.long()]  # [V, n, T]
+    # decode
+    recons = codebook.recons(trellis)
+    assert recons.shape[0] == 1
+    recons = recons[0]
 
-    if recons.shape[0] == 1:
-        recons = recons[0]  # [n, T]
-    else:
-        raise NotImplementedError("当前只支持 V=1 的 codebook")
+    row_blocks = m // td_x
+    col_blocks = recons.shape[0] // row_blocks
+    n = col_blocks * td_y
 
     hatW = (
-        recons.transpose(0, 1)  # [T, n]
-        .reshape(n, td_x, td_y).transpose(0, 1)  # [td_x, n, td_y]
-        .reshape(m, n)  # 最终矩阵 [m, n]
+        recons
+        .view(row_blocks, col_blocks, td_x, td_y)
+        .transpose(1, 2)
+        .reshape(m, n)
     )
 
-    # GEMM 乘法 + 缩放
-    output = input @ hatW.T
-    return output / scale
+    out = input.matmul(hatW.T)  # [B, n]
+    return (out * SV * scale).to(input.dtype)  # ← SV corrects output
 
 
 # gptq

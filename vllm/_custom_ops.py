@@ -232,6 +232,85 @@ def awq_gemm(input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor,
     return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
 
 
+# qtip
+def bitshift_codebook(L: int, K: int, V: int, tlut_bits: int,
+                      decode_mode: str) -> torch.Tensor:
+    """
+    创建QTIP的codebook
+    
+    Args:
+        L: 每个权重的比特数
+        K: 每个codebook的条目数
+        V: codebook的数量
+        tlut_bits: 查表比特数
+        decode_mode: 解码模式
+        
+    Returns:
+        codebook: [V, 2^L] 形状的codebook张量
+    """
+    # 创建基础codebook
+    codebook = torch.zeros((V, 2**L), dtype=torch.float16)
+
+    # 根据decode_mode初始化codebook
+    if decode_mode == "uniform":
+        # 均匀分布
+        for v in range(V):
+            for i in range(2**L):
+                codebook[v, i] = (i - 2**(L - 1)) / (2**(L - 1))
+    elif decode_mode == "gaussian":
+        # 高斯分布
+        for v in range(V):
+            for i in range(2**L):
+                codebook[v, i] = torch.randn(1).item()
+    else:
+        raise ValueError(f"不支持的decode_mode: {decode_mode}")
+
+    return codebook
+
+
+def bitshift_gemm(input: torch.Tensor,
+                  trellis: torch.Tensor,
+                  codebook: torch.Tensor,
+                  td_x: int,
+                  td_y: int,
+                  scale: float = 32.0) -> torch.Tensor:
+    """
+    QTIP Bitshift GEMM (Pure Python fallback).
+    
+    Args:
+        input: [B, K] 输入激活
+        trellis: [num_blocks, T] trellis 编码索引
+        codebook: [V, 2^L] 查表（浮点重建）
+        td_x, td_y: tile 大小，用于还原矩阵形状
+        scale: 最终缩放因子（默认 QTIP 使用 32）
+
+    Returns:
+        output: [B, N] 推理乘法结果
+    """
+    B, K = input.shape
+    m = K
+    n = trellis.shape[0]
+    T = td_x * td_y
+
+    # 重建量化权重矩阵
+    recons = codebook[:, trellis.long()]  # [V, n, T]
+
+    if recons.shape[0] == 1:
+        recons = recons[0]  # [n, T]
+    else:
+        raise NotImplementedError("当前只支持 V=1 的 codebook")
+
+    hatW = (
+        recons.transpose(0, 1)  # [T, n]
+        .reshape(n, td_x, td_y).transpose(0, 1)  # [td_x, n, td_y]
+        .reshape(m, n)  # 最终矩阵 [m, n]
+    )
+
+    # GEMM 乘法 + 缩放
+    output = input @ hatW.T
+    return output / scale
+
+
 # gptq
 def gptq_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,
               b_gptq_qzeros: torch.Tensor, b_gptq_scales: torch.Tensor,

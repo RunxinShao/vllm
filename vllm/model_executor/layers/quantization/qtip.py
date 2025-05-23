@@ -80,7 +80,7 @@ class QTIPLinearMethod(LinearMethodBase):
     """
     QTIP linear layer quantization method
     """
-    def __init__(self, quant_config: QTIPConfig):
+    def __init__(self, quant_config: Config):
         self.cfg = quant_config
         # Build lookup table (codebook)
         self.cb = bitshift_codebook(

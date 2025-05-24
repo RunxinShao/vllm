@@ -32,7 +32,7 @@ QuantizationMethods = Literal[
     "ipex",
     "quark",
     "moe_wna16",
-    "qtip",,
+    "qtip",
     "torchao",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -108,10 +108,10 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .neuron_quant import NeuronQuantConfig
     from .ptpc_fp8 import PTPCFp8Config
     from .qqq import QQQConfig
+    from .qtip import QTIPConfig
     from .torchao import TorchAOConfig
     from .tpu_int8 import Int8TpuConfig
-    from .qtip import QTIPConfig
-    
+
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "aqlm": AQLMConfig,
         "awq": AWQConfig,

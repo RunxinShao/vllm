@@ -4,8 +4,10 @@ import contextlib
 import importlib
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
 import torch
 import torch.library
+import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -367,15 +369,19 @@ def awq_gemm(input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor,
         return awq_gemm_triton(input, qweight, qzeros, scales, split_k_iters)
     return torch.ops._C.awq_gemm(input, qweight, qzeros, scales, split_k_iters)
 
+
 # qtip
+
 
 def decode_1mad(x: torch.Tensor) -> torch.Tensor:
     x = x.to(torch.int64) & ((1 << 32) - 1)
     x = x * 34038481 + 76625530
     x = x & ((1 << 32) - 1)
-    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)
+    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (
+        (x >> 24) & 0xFF)
     y = y - 510
     return (y.to(torch.float32) / 147.800537109375)
+
 
 def decode_2mad(x: torch.Tensor) -> torch.Tensor:
     x = x.to(torch.int64) & ((1 << 32) - 1)
@@ -383,16 +389,19 @@ def decode_2mad(x: torch.Tensor) -> torch.Tensor:
     x = x & ((1 << 32) - 1)
     x = ((x * 1664525) >> 32) + x
     x = x & ((1 << 32) - 1)
-    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)
+    y = (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (
+        (x >> 24) & 0xFF)
     y = y - 510
     return (y.to(torch.float32) / 147.800537109375)
 
+
 def decode_3inst(x: torch.Tensor) -> torch.Tensor:
+
     def bfe16_to_fp16(z: torch.Tensor) -> torch.Tensor:
         arr = z.to(torch.int32)
         mask = arr >= (1 << 15)
         arr[mask] -= (1 << 16)
-        # 先在 CPU 上将 int16 reinterpret 为 float16，再搬回 GPU
+
         tmp = arr.to(torch.int16).cpu().numpy().view(np.float16)
         return torch.from_numpy(tmp).to(z.device)
 
@@ -406,15 +415,17 @@ def decode_3inst(x: torch.Tensor) -> torch.Tensor:
     bot = bfe16_to_fp16(res & 0xFFFF)
     return (top + bot).float()
 
+
 def quantlut(tlut: torch.Tensor, L: int, nbits: int) -> torch.Tensor:
-    # 非对称 quantlut
+
     lut = torch.arange(1 << L, device=tlut.device)
     lut = (lut + 1) * lut
     lut = (lut >> (16 - nbits)) & ((1 << nbits) - 1)
     return tlut[lut].T.contiguous()
 
+
 def quantlut_sym(tlut: torch.Tensor, L: int, nbits: int) -> torch.Tensor:
-    # 对称 quantlut
+
     lut = torch.arange(1 << L, device=tlut.device)
     lut = (lut + 1) * lut
     sign = 1 - ((lut >> 15) & 1) * 2
@@ -423,9 +434,12 @@ def quantlut_sym(tlut: torch.Tensor, L: int, nbits: int) -> torch.Tensor:
     out[:, 0] = out[:, 0] * sign
     return out.T.contiguous()
 
+
 # --- bitshift_codebook definition ---
 
+
 class bitshift_codebook(nn.Module):
+
     def __init__(self,
                  L: int,
                  K: int,
@@ -485,19 +499,14 @@ class bitshift_codebook(nn.Module):
         encoded: LongTensor([num_blocks, td_x*td_y])
         returns: FloatTensor([V, num_blocks, td_x*td_y])
         """
-        # encoded.long() ensures proper dtype, then gather from lut
-        # self.lut shape = [V, levels]
-        return self.lut[:, encoded.long()]
-def bitshift_gemm(
-    input: torch.Tensor,
-    trellis: torch.Tensor,
-    codebook: bitshift_codebook,
-    td_x: int,
-    td_y: int,
-    scale: float,
-    SU: torch.Tensor,
-    SV: torch.Tensor
-) -> torch.Tensor:
+
+        return self.lut.to(encoded.device)[:, encoded.long()]
+
+
+def bitshift_gemm(input: torch.Tensor, trellis: torch.Tensor,
+                  codebook: bitshift_codebook, td_x: int, td_y: int,
+                  scale: float, SU: torch.Tensor,
+                  SV: torch.Tensor) -> torch.Tensor:
     """
     Python fallback for QTIP Bitshift GEMM.
 
@@ -521,7 +530,7 @@ def bitshift_gemm(
         output: [B, n]  result of dequantized GEMM
     """
     B, m = input.shape
-    input = input.to(torch.float32) * SU  # ← SU corrects input
+    input = input * SU  # ← SU corrects input
 
     # decode
     recons = codebook.recons(trellis)
@@ -532,12 +541,8 @@ def bitshift_gemm(
     col_blocks = recons.shape[0] // row_blocks
     n = col_blocks * td_y
 
-    hatW = (
-        recons
-        .view(row_blocks, col_blocks, td_x, td_y)
-        .transpose(1, 2)
-        .reshape(m, n)
-    )
+    hatW = (recons.view(row_blocks, col_blocks, td_x,
+                        td_y).transpose(1, 2).reshape(m, n))
 
     out = input.matmul(hatW.T)  # [B, n]
     return (out * SV * scale).to(input.dtype)  # ← SV corrects output

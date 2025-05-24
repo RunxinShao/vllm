@@ -243,29 +243,9 @@ class LinearBase(torch.nn.Module):
                                                               prefix=prefix)
         self.return_bias = return_bias
 
-<<<<<<< HEAD
-    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-       
-        if isinstance(param, PackedvLLMParameter):
-           
-            unpacked_weight = self.quant_method.cb.unpack_trellis(
-                loaded_weight, self.quant_method.quant_config.td_x *
-                self.quant_method.quant_config.td_y)
-            param.data.copy_(unpacked_weight)
-        else:
-            
-            if len(loaded_weight.shape) == 0:
-                loaded_weight = loaded_weight.reshape(1)
-            assert param.size() == loaded_weight.size()
-            param.data.copy_(loaded_weight)
-
-    def forward(self,
-                x: torch.Tensor) -> tuple[torch.Tensor, Optional[Parameter]]:
-=======
     def forward(
         self, x: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
->>>>>>> upstream/main
         raise NotImplementedError
 
 
